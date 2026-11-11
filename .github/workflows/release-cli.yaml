@@ -1,0 +1,208 @@
+name: Release CLI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read CLI version
+        uses: SebRollen/toml-action@b1b3628f55fc3a28208d4203ada8b737e9687876 # v1.2.0
+        id: read_cli_version
+        with:
+          file: './cli/Cargo.toml'
+          field: 'package.version'
+      - name: Check Release Version is Same as CLI Version
+        if: ${{ !endsWith(github.ref, steps.read_cli_version.outputs.value) }}
+        run: |
+          echo "Tag version ${{ github.ref }} doesn't match Cargo.toml version ${{ steps.read_cli_version.outputs.value }}";
+          echo "Did you forget to update version in Cargo.toml?"
+          exit 1
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@0cb9c9b65d5d1901c1f53e5e66eaf4afd303e70e # v1.1.4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: ${{ github.ref }}
+          body: |
+            TODO: Write release notes
+          draft: false
+          prerelease: false
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+
+  build-linux:
+    name: Release Artifacts on Linux
+    needs:
+      - create-release
+    strategy:
+      matrix:
+        box:
+          - { runner: ubuntu-24.04, arch: amd64 }
+          - { runner: arm-runner, arch: arm64 }
+    runs-on: ${{ matrix.box.runner }}
+    timeout-minutes: 45
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl build-essential libssl-dev pkg-config software-properties-common
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-15 g++-15
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 100
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-15 100
+          sudo update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-15 100
+          sudo update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-15 100
+
+      - name: Install Rust Toolchain
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
+        with:
+          profile: minimal
+          toolchain: stable
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build and Package
+        run: |
+          cd cli
+          cargo build --release
+
+          # Build gzip package
+          cd ./target/release && tar -czvf dbdev.tar.gz ./dbdev
+          cd ../..
+
+          # Build debian package
+          package_dir="dbdev-${{ github.ref_name }}-linux-${{ matrix.box.arch }}"
+          mkdir -p "${package_dir}/usr/local/bin"
+          cp ./target/release/dbdev "${package_dir}/usr/local/bin/dbdev"
+
+          extension_version="${{ github.ref_name }}"
+          # strip the leading v
+          deb_version="${extension_version:1}"
+
+          mkdir -p "${package_dir}/DEBIAN"
+          touch "${package_dir}/DEBIAN/control"
+          echo 'Package: dbdev' >> ${package_dir}/DEBIAN/control
+          echo 'Version:' ${deb_version} >> ${package_dir}/DEBIAN/control
+          echo 'Architecture: ${{ matrix.box.arch }}' >> ${package_dir}/DEBIAN/control
+          echo 'Maintainer: supabase' >> ${package_dir}/DEBIAN/control
+          echo 'Description: CLI for publishing to database.dev' >> ${package_dir}/DEBIAN/control
+
+          # Create deb package
+          sudo chmod -R 00755 "${package_dir}"
+          sudo dpkg-deb --build "${package_dir}"
+
+      - name: Upload gzip Package
+        uses: actions/upload-release-asset@e8f9f06c4b078e705bd2ea027f0926603fc9b4d5 # v1.0.2
+        env:
+          UPLOAD_URL: ${{ needs.create-release.outputs.upload_url }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ env.UPLOAD_URL }}
+          asset_path: ./cli/target/release/dbdev.tar.gz
+          asset_name: dbdev-${{ github.ref_name }}-linux-${{ matrix.box.arch }}.tar.gz
+          asset_content_type: application/gzip
+
+      - name: Upload Debian Package
+        uses: actions/upload-release-asset@e8f9f06c4b078e705bd2ea027f0926603fc9b4d5 # v1.0.2
+        env:
+          UPLOAD_URL: ${{ needs.create-release.outputs.upload_url }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ env.UPLOAD_URL }}
+          asset_path: ./cli/dbdev-${{ github.ref_name }}-linux-${{ matrix.box.arch }}.deb
+          asset_name: dbdev-${{ github.ref_name }}-linux-${{ matrix.box.arch }}.deb
+          asset_content_type: application/vnd.debian.binary-package
+
+  build-macos:
+    name: Release Artifacts on macOS
+    needs:
+      - create-release
+    strategy:
+      matrix:
+        os: [macos-15-intel, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - name: Install Rust Toolchain
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
+        with:
+          profile: minimal
+          toolchain: stable
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build and Package
+        run: |
+          cd cli
+          cargo build --release
+          cd ./target/release && tar -czvf dbdev.tar.gz ./dbdev
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@e8f9f06c4b078e705bd2ea027f0926603fc9b4d5 # v1.0.2
+        env:
+          UPLOAD_URL: ${{ needs.create-release.outputs.upload_url }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ env.UPLOAD_URL }}
+          asset_path: ./cli/target/release/dbdev.tar.gz
+          asset_name: dbdev-${{ github.ref_name }}-macos-${{ runner.arch == 'X64' && 'amd64' || 'arm64' }}.tar.gz
+          asset_content_type: application/gzip
+
+  build-windows:
+    name: Release Artifacts on Windows
+    needs:
+      - create-release
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Install Rust Toolchain
+        uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
+        with:
+          profile: minimal
+          toolchain: stable
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build and Package
+        run: |
+          cd cli
+          cargo build --release
+          cd ./target/release && Compress-Archive -Path ./dbdev.exe -Destination dbdev.zip
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@e8f9f06c4b078e705bd2ea027f0926603fc9b4d5 # v1.0.2
+        env:
+          UPLOAD_URL: ${{ needs.create-release.outputs.upload_url }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ env.UPLOAD_URL }}
+          asset_path: ./cli/target/release/dbdev.zip
+          asset_name: dbdev-${{ github.ref_name }}-windows-amd64.zip
+          asset_content_type: application/zip
+
+  release-homebrew-tap:
+    needs:
+      - build-linux
+      - build-macos
+    uses: ./.github/workflows/release-homebrew-tap.yaml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit
+
+  release-scoop-bucket:
+    needs:
+      - build-windows
+    uses: ./.github/workflows/release-scoop-bucket.yaml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit

@@ -1,0 +1,321 @@
+use crate::util;
+
+use anyhow::Context;
+use std::ffi::OsStr;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+pub struct ControlFileRef {
+    pub filename: String,
+    pub contents: String,
+}
+
+#[derive(Debug)]
+pub struct Metadata {
+    pub extension_name: String,
+    pub default_version: String,
+    pub comment: Option<String>,
+    pub schema: Option<String>,
+    pub relocatable: bool,
+    pub requires: Vec<String>,
+}
+
+impl Metadata {
+    fn from_control_file_ref(control_file_ref: &ControlFileRef) -> anyhow::Result<Self> {
+        Ok(Self {
+            extension_name: control_file_ref.extension_name()?.clone(),
+            default_version: control_file_ref.default_version()?.clone(),
+            comment: control_file_ref.comment()?.clone(),
+            relocatable: control_file_ref.relocatable()?,
+            requires: control_file_ref.requires()?.clone(),
+            schema: control_file_ref.schema()?.clone(),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct InstallFile {
+    pub filename: String,
+    pub version: String,
+    pub body: String,
+}
+
+#[derive(Debug)]
+pub struct UpgradeFile {
+    pub filename: String,
+    pub from_version: String,
+    pub to_version: String,
+    pub body: String,
+}
+
+#[derive(Debug)]
+pub struct ReadmeFile {
+    pub body: String,
+}
+
+impl ReadmeFile {
+    pub(crate) fn from_path(path: &Path) -> anyhow::Result<ReadmeFile> {
+        let file_name = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .context("Failed to read file name")?;
+        let body =
+            fs::read_to_string(path).context(format!("Failed to read file {}", &file_name))?;
+        Ok(ReadmeFile { body })
+    }
+
+    pub(crate) fn body(&self) -> &str {
+        &self.body
+    }
+}
+
+#[derive(sqlx::FromRow)]
+pub(crate) struct ExtensionVersion {
+    pub(crate) version: String,
+}
+
+#[derive(sqlx::FromRow, PartialEq, Eq, Hash)]
+pub(crate) struct UpdatePath {
+    pub(crate) source: String,
+    pub(crate) target: String,
+}
+
+#[derive(Debug)]
+pub struct Payload {
+    pub metadata: Metadata,
+    pub install_files: Vec<InstallFile>,
+    pub upgrade_files: Vec<UpgradeFile>,
+    pub readme_file: Option<ReadmeFile>,
+}
+
+impl Payload {
+    pub fn from_path(path: &Path) -> anyhow::Result<Self> {
+        // Install from Path
+        let abs_path = match fs::canonicalize(path) {
+            Ok(abs_path) => abs_path,
+            Err(e) => {
+                return Err(anyhow::anyhow!("Error: {:?}", e));
+            }
+        };
+
+        if !abs_path.is_dir() {
+            return Err(anyhow::anyhow!("Error: *path* is not a directory"));
+        }
+
+        let mut control_files = vec![];
+        let mut sql_files = vec![];
+        let mut readme_file: Option<PathBuf> = None;
+
+        for entry in fs::read_dir(&abs_path).unwrap() {
+            match entry {
+                Ok(dir_entry) => {
+                    let entry_path = dir_entry.path();
+                    if entry_path.is_dir() {
+                        continue;
+                    }
+                    if let Some("README.md") = entry_path.file_name().and_then(OsStr::to_str) {
+                        readme_file = Some(entry_path);
+                        continue;
+                    }
+                    let extension: Option<&str> = entry_path.extension().and_then(OsStr::to_str);
+                    match extension {
+                        Some("control") => control_files.push(entry_path),
+                        Some("sql") => sql_files.push(entry_path),
+                        _ => continue,
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+
+        let readme_file = readme_file
+            .map(|path| ReadmeFile::from_path(&path))
+            .transpose()?;
+
+        // /User/<abridge>/some_ext/some_ext.control
+        let control_file_path = match control_files.len() {
+            0 => return Err(anyhow::anyhow!("no control file detected")),
+            1 => control_files
+                .pop()
+                .context("failed to reference control file")?,
+            _ => return Err(anyhow::anyhow!("multiple control files detected")),
+        };
+
+        // some_ext
+        let control_file = ControlFileRef::from_pathbuf(&control_file_path)?;
+
+        let extension_name = control_file.extension_name()?;
+
+        if !util::is_valid_extension_name(&extension_name) {
+            return Err(anyhow::anyhow!(
+                "Invalid extension name detected: {}. It must begin with an alphabet, contain only alphanumeric characters or `_` and should be between 2 and 32 characters long.",
+                extension_name
+            ));
+        }
+
+        // TODO: follow the some_ext.control `directory` parameter allowing sql scripts to
+        // be somewhere other than the repo root
+        let mut install_files = vec![];
+        let mut upgrade_files = vec![];
+
+        for path in sql_files {
+            let file_name = path.file_name().and_then(OsStr::to_str).unwrap();
+            let parts: Vec<&str> = file_name
+                .strip_suffix(".sql")
+                .unwrap()
+                .split("--")
+                .collect();
+            match &parts[..] {
+                [file_ext_name, ver] => {
+                    // Make sure the file's extension name matches the control file
+                    if file_ext_name != &extension_name {
+                        println!("Warning: file `{file_name}` will be skipped because its extension name(`{file_ext_name}`) doesn't match `{extension_name}`");
+                        continue;
+                    }
+                    if !util::is_valid_version(ver) {
+                        println!("Warning: file `{file_name}` will be skipped because its version (`{ver}`) is invalid. It should be have the format `major.minor.patch`.");
+                        continue;
+                    }
+
+                    let ifile = InstallFile {
+                        filename: file_name.to_string(),
+                        version: ver.to_string(),
+                        body: fs::read_to_string(&path)
+                            .context(format!("Failed to read file {}", &file_name))?,
+                    };
+                    install_files.push(ifile);
+                }
+                [file_ext_name, from_ver, to_ver] => {
+                    // Make sure the file's extension name matches the control file
+                    if file_ext_name != &extension_name {
+                        println!("Warning: file `{file_name}` will be skipped because its extension name(`{file_ext_name}`) doesn't match `{extension_name}`");
+                        continue;
+                    }
+                    if !util::is_valid_version(from_ver) {
+                        println!("Warning: file `{file_name}` will be skipped because its from version(`{from_ver}`) is invalid. It should be have the format `major.minor.patch`.");
+                        continue;
+                    }
+                    if !util::is_valid_version(to_ver) {
+                        println!("Warning: file `{file_name}` will be skipped because its from version(`{to_ver}`) is invalid. It should be have the format `major.minor.patch`.");
+                        continue;
+                    }
+
+                    let ufile = UpgradeFile {
+                        filename: file_name.to_string(),
+                        from_version: from_ver.to_string(),
+                        to_version: to_ver.to_string(),
+                        body: fs::read_to_string(&path)
+                            .context(format!("Failed to read file {}", &file_name))?,
+                    };
+                    upgrade_files.push(ufile);
+                }
+                _ => (),
+            }
+        }
+
+        let payload = Payload {
+            metadata: Metadata::from_control_file_ref(&control_file)?,
+            install_files,
+            upgrade_files,
+            readme_file,
+        };
+        Ok(payload)
+    }
+}
+
+impl ControlFileRef {
+    fn from_pathbuf(path: &Path) -> anyhow::Result<Self> {
+        let control_file_name = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .context("failed to read control file name")?
+            .to_string();
+
+        let control_file_body = fs::read_to_string(path).context("failed to read control file")?;
+
+        Ok(Self {
+            filename: control_file_name,
+            contents: control_file_body,
+        })
+    }
+
+    // Name of the extension. Used in the `create extesnion <extension_name>`
+    fn extension_name(&self) -> anyhow::Result<String> {
+        self.filename
+            .strip_suffix(".control")
+            .context("failed to read extension name from control file")
+            .map(str::to_string)
+    }
+
+    // A comment (any string) about the extension. The comment is applied when initially creating
+    // an extension, but not during extension updates (since that might override user-added
+    // comments). Alternatively, the extension's comment can be set by writing a COMMENT command
+    // in the script file.
+    fn comment(&self) -> anyhow::Result<Option<String>> {
+        for line in self.contents.lines() {
+            if line.starts_with("comment") {
+                return Ok(Some(self.read_control_line_value(line)?));
+            }
+        }
+        Ok(None)
+    }
+
+    // A list of names of extensions that this extension depends on, for example requires = 'foo,
+    // bar'. Those extensions must be installed before this one can be installed.
+    fn requires(&self) -> anyhow::Result<Vec<String>> {
+        for line in self.contents.lines() {
+            if line.starts_with("requires") {
+                let value = self.read_control_line_value(line)?;
+                let required_packages: Vec<String> =
+                    value.split(',').map(|x| x.trim().to_string()).collect();
+                return Ok(required_packages);
+            }
+        }
+        Ok(vec![])
+    }
+
+    // The schema the extension wants to be installed in, if any
+    fn schema(&self) -> anyhow::Result<Option<String>> {
+        for line in self.contents.lines() {
+            if line.starts_with("schema") {
+                let value = self.read_control_line_value(line)?;
+                return Ok(Some(value.trim().to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn relocatable(&self) -> anyhow::Result<bool> {
+        for line in self.contents.lines() {
+            if line.starts_with("relocatable") {
+                let value: bool = self.read_control_line_value(line)?.parse()?;
+                return Ok(value);
+            }
+        }
+        Ok(false)
+    }
+
+    fn default_version(&self) -> anyhow::Result<String> {
+        for line in self.contents.lines() {
+            if line.starts_with("default_version") {
+                return self.read_control_line_value(line);
+            }
+        }
+        Err(anyhow::anyhow!(
+            "`default_version` in control file is required"
+        ))
+    }
+
+    fn read_control_line_value(&self, line: &str) -> anyhow::Result<String> {
+        let parts: Vec<&str> = line.split('=').collect();
+        match &parts[..] {
+            [_, value] => {
+                let mut base_value = value.trim();
+                base_value = base_value.strip_prefix('\'').unwrap_or(base_value);
+                base_value = base_value.strip_suffix('\'').unwrap_or(base_value);
+                Ok(base_value.to_string())
+            }
+            _ => Err(anyhow::anyhow!("invalid line in control file")),
+        }
+    }
+}

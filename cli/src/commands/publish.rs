@@ -1,0 +1,131 @@
+use std::collections::HashSet;
+use std::path::Path;
+
+use crate::client::{
+    self, PublishPackageRequest, PublishPackageUpgradeRequest, PublishPackageVersionRequest,
+};
+use crate::credential_store::Credentials;
+use crate::models::{self, InstallFile, Payload, ReadmeFile, UpgradeFile};
+
+pub async fn publish(
+    client: &client::ApiClient<'_>,
+    package_foler_path: &Path,
+    registry_name: &str,
+) -> anyhow::Result<()> {
+    let credentials = Credentials::read()?;
+    let access_token = credentials.get_token(registry_name)?.value.clone().into();
+
+    let jwt = client.redeem_access_token(access_token).await?;
+
+    let payload = models::Payload::from_path(package_foler_path)?;
+    let Some(ref readme_file) = payload.readme_file else {
+        return Err(anyhow::anyhow!("No `README.md` file found"));
+    };
+
+    let valid_versions = get_valid_versions(&payload);
+    let request = create_publish_package_request(&payload);
+    if !valid_versions.contains(request.default_version) {
+        return Err(anyhow::anyhow!(
+            "default_version in control file should be set to one of the following: {}",
+            valid_versions.into_iter().collect::<Vec<&str>>().join(", ")
+        ));
+    }
+    client.publish_package(&jwt, &request).await?;
+
+    if payload.install_files.is_empty() {
+        return Err(anyhow::anyhow!("No valid script file (.sql) found."));
+    }
+
+    let mut num_published = 0;
+
+    for install_file in &payload.install_files {
+        let request = create_publich_package_version_request(
+            &payload.metadata.extension_name,
+            install_file,
+            readme_file,
+        );
+        if client
+            .publish_package_version(&jwt, &request)
+            .await?
+            .is_some()
+        {
+            num_published += 1;
+            println!(
+                "Published package {} version {}",
+                request.package_name, request.version
+            );
+        }
+    }
+
+    for upgrade_file in &payload.upgrade_files {
+        let request =
+            create_publich_package_upgrade_request(&payload.metadata.extension_name, upgrade_file);
+        if client
+            .publish_package_upgrade(&jwt, &request)
+            .await?
+            .is_some()
+        {
+            num_published += 1;
+            println!(
+                "Published package {} upgrade from {} to {}",
+                request.package_name, request.from_version, request.to_version
+            );
+        }
+    }
+
+    if num_published == 0 {
+        println!("Updated package properties");
+    }
+
+    Ok(())
+}
+
+fn create_publish_package_request(payload: &'_ Payload) -> PublishPackageRequest<'_> {
+    PublishPackageRequest {
+        package_name: &payload.metadata.extension_name,
+        package_description: &payload.metadata.comment,
+        relocatable: payload.metadata.relocatable,
+        requires: &payload.metadata.requires,
+        default_version: &payload.metadata.default_version,
+    }
+}
+
+fn create_publich_package_version_request<'a>(
+    package_name: &'a str,
+    install_file: &'a InstallFile,
+    readme_file: &'a ReadmeFile,
+) -> PublishPackageVersionRequest<'a> {
+    PublishPackageVersionRequest {
+        package_name,
+        version: &install_file.version,
+        version_source: &install_file.body,
+        version_description: readme_file.body(),
+    }
+}
+
+fn create_publich_package_upgrade_request<'a>(
+    package_name: &'a str,
+    upgrade_file: &'a UpgradeFile,
+) -> PublishPackageUpgradeRequest<'a> {
+    PublishPackageUpgradeRequest {
+        package_name,
+        from_version: &upgrade_file.from_version,
+        to_version: &upgrade_file.to_version,
+        upgrade_source: &upgrade_file.body,
+    }
+}
+
+fn get_valid_versions(payload: &Payload) -> HashSet<&str> {
+    let mut valid_versions: HashSet<&str> = HashSet::new();
+
+    for install_file in &payload.install_files {
+        valid_versions.insert(&install_file.version);
+    }
+
+    for upgrade_file in &payload.upgrade_files {
+        valid_versions.insert(&upgrade_file.from_version);
+        valid_versions.insert(&upgrade_file.to_version);
+    }
+
+    valid_versions
+}
